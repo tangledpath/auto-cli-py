@@ -9,13 +9,28 @@
 .pytest_cache
 __pycache__
 
-# Setuptools distribution folder.
-dist
-build
-
-# Python egg metadata, regenerated from source files by setuptools.
-/*.egg-info
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
 .egg*
+
+# Poetry
+.venv/
+poetry.lock
+
+# Coverage
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Linting
+.ruff_cache/
+
+# Pre-commit
+.pre-commit-cache/
 
 # Logs
 logs
@@ -23,5 +38,8 @@ logs
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
+
+# Python version
+.python-version
 
 junk.txt

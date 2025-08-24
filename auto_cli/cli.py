@@ -1,248 +1,544 @@
+# Auto-generate CLI from function signatures and docstrings.
 import argparse
-from collections import OrderedDict
 import enum
-import functools
 import inspect
 import sys
 import traceback
-from typing import Dict
+import types
+from collections.abc import Callable
+from typing import Any, Optional, Type, Union
 
-TOP_LEVEL_ARGS=['func', 'help', 'verbose']
+
+from .command_executor import CommandExecutor
+from .command_builder import CommandBuilder
+from .docstring_parser import extract_function_help, parse_docstring
+from .formatter import HierarchicalHelpFormatter
+
+Target = Union[types.ModuleType, Type[Any]]
+
+
+class TargetMode(enum.Enum):
+  """Target mode enum for CLI generation."""
+  MODULE = 'module'
+  CLASS = 'class'
+
 
 class CLI:
-  class ArgFormatter(argparse.HelpFormatter):
-    """Help message formatter which adds default values to argument help.
-    Only the name of this class is considered a public API. All the methods
-    provided by the class are considered an implementation detail.
+  """Automatically generates CLI from module functions or class methods using introspection."""
+
+  def __init__(self, target: Target, title: Optional[str] = None, function_filter: Optional[Callable] = None,
+               method_filter: Optional[Callable] = None, theme=None, alphabetize: bool = True, 
+               enable_completion: bool = False):
+    """Initialize CLI generator with auto-detection of target type.
+
+    :param target: Module or class containing functions/methods to generate CLI from
+    :param title: CLI application title (auto-generated from class docstring if None for classes)
+    :param function_filter: Optional filter function for selecting functions (module mode)
+    :param method_filter: Optional filter function for selecting methods (class mode)
+    :param theme: Optional theme for colored output
+    :param alphabetize: If True, sort commands and options alphabetically
+    :param enable_completion: Enable shell completion support
     """
+    # Auto-detect target type
+    if inspect.isclass(target):
+      self.target_mode = TargetMode.CLASS
+      self.target_class = target
+      self.target_module = None
+      self.title = title or self.__extract_class_title(target)
+      self.method_filter = method_filter or self.__default_method_filter
+      self.function_filter = None
+    elif inspect.ismodule(target):
+      self.target_mode = TargetMode.MODULE
+      self.target_module = target
+      self.target_class = None
+      self.title = title or "CLI Application"
+      self.function_filter = function_filter or self.__default_function_filter
+      self.method_filter = None
+    else:
+      raise ValueError(f"Target must be a module or class, got {type(target).__name__}")
 
-    def _get_help_string(self, action):
-      help = action.help
-      print("HERE, orig helop", dir(action))
-      print(action)
-      if '%(default)' not in action.help:
-        if action.default is not argparse.SUPPRESS:
-          defaulting_nargs = [argparse.OPTIONAL, argparse.ZERO_OR_MORE]
-          if action.option_strings or action.nargs in defaulting_nargs:
-            help += ' (default: %(default)s)'
-            pass
-      #help+=":%(type)s"  if hasattr(action,'type') else '' # in action else '' #Default=[%(default)s]') if 'default' in parm_opts else ''
-      # help+="=%(default)s" if 'default' in action else ''
-      # help+="  -> [%(choices)s]" if 'choices' in action else ''
+    self.theme = theme
+    self.alphabetize = alphabetize
+    self.enable_completion = enable_completion
 
-      return help
+    # Discover functions/methods based on target mode
+    if self.target_mode == TargetMode.MODULE:
+      self.__discover_functions()
+    else:
+      self.__discover_methods()
 
-  def __init__(self, target_module, title, function_opts:Dict[str, Dict]):
-    self.target_module = target_module
-    self.title = title
-    self.function_opts = function_opts
+    # Initialize command executor after metadata is set up
+    self.command_executor = CommandExecutor(
+        target_class=self.target_class,
+        target_module=self.target_module,
+        inner_class_metadata=getattr(self, 'inner_class_metadata', {})
+    )
 
-  def fn_callback(self, fn_name, args):
-    res = self.execute_model_fn(fn_name, args)
-    print(f"[{self.title}] Results for {fn_name}", res)
+  def display(self):
+    """Legacy method for backward compatibility - runs the CLI."""
+    self.run()
 
-  def execute_model_fn(self, fn_name:str, fn_args:Dict):
-    fn = getattr(self.target_module, fn_name)
-    return fn(**fn_args)
+  def run(self, args: list | None = None) -> Any:
+    """Parse arguments and execute the appropriate function."""
+    # Check for completion requests early
+    if self.enable_completion and self._is_completion_request():
+      self._handle_completion()
 
-  def sig_parms(self, fn_name:str):
-    fn = getattr(self.target_module, fn_name)
-    sigs = inspect.signature(fn)
-    return sigs.parameters
+    # First, do a preliminary parse to check for --no-color flag
+    # This allows us to disable colors before any help output is generated
+    no_color = False
+    if args:
+      no_color = '--no-color' in args or '-n' in args
 
-  @staticmethod
-  def add_sig_parm_args(sig_parms:OrderedDict, subparser):
+    parser = self.create_parser(no_color=no_color)
+    parsed = None
 
-    for parm_name, parm in sig_parms.items():
-      parm_opts = {}
+    try:
+      parsed = parser.parse_args(args)
 
-      has_default = parm.default is not parm.empty
+      # Handle missing command scenarios
+      if not hasattr(parsed, '_cli_function'):
+        # argparse has already handled validation, just show appropriate help
+        if hasattr(parsed, 'command') and parsed.command:
+          # User specified a valid group command, find and show its help
+          for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction) and parsed.command in action.choices:
+              action.choices[parsed.command].print_help()
+              return 0
+        
+        # No command or unknown command, show main help  
+        parser.print_help()
+        return 0
+      else:
+        # Execute the command using CommandExecutor
+        return self.command_executor.execute_command(
+            parsed, 
+            self.target_mode, 
+            getattr(self, 'use_inner_class_pattern', False),
+            getattr(self, 'inner_class_metadata', {})
+        )
 
-      annotation = parm.annotation
-      if annotation is not parm.empty:
-        if annotation == str:
-          parm_opts['type'] = str
-          if has_default:
-            parm_opts['default'] = parm.default# f'"{str(parm.default)}"'
-        elif annotation == int:
-          parm_opts['type'] = int
-          if has_default:
-            parm_opts['default'] =  parm.default
-        elif annotation == bool:
-          parm_opts['type'] = bool
-          if has_default:
-            parm_opts['default'] =  parm.default
-        elif annotation == float:
-          parm_opts['type'] = float
-          if has_default:
-            parm_opts['default'] =  parm.default
-        elif issubclass(annotation, enum.Enum):
+    except SystemExit:
+      # Let argparse handle its own exits (help, errors, etc.)
+      raise
+    except Exception as e:
+      # Handle execution errors gracefully
+      if parsed is not None:
+        return self.command_executor.handle_execution_error(parsed, e)
+      else:
+        # If parsing failed, this is likely an argparse error - re-raise as SystemExit
+        raise SystemExit(1)
 
-          # Easy lookup for enumeration types:
-          def choice_type_fn(enum_type:enum.Enum, arg:str):
-            return enum_type[arg.split(".")[-1]]
+  def __extract_class_title(self, cls: type) -> str:
+    """Extract title from class docstring, similar to function docstring extraction."""
+    if cls.__doc__:
+      main_desc, _ = parse_docstring(cls.__doc__)
+      return main_desc or cls.__name__
+    return cls.__name__
 
-          # Convert enumeration to choices:
-          parm_opts['choices'] = [e for e in annotation]
-          parm_opts['type'] = functools.partial(choice_type_fn, annotation)
+  def __default_function_filter(self, name: str, obj: Any) -> bool:
+    """Default filter: include non-private callable functions defined in this module."""
+    return (
+        not name.startswith('_') and
+        callable(obj) and
+        not inspect.isclass(obj) and
+        inspect.isfunction(obj) and
+        obj.__module__ == self.target_module.__name__  # Exclude imported functions
+    )
 
-          if has_default and hasattr(parm.default, 'name'):
-            # Set default to friendly enum value:
-            parm_opts['default'] = f"{parm.default}"
-        else:
-          pass
-          #parm_opts['type'] = "unknown" #f"**{'xox'}(**)" #str(annotation)
-          #print("UNRECOG ANNOT", annotation)
+  def __default_method_filter(self, name: str, obj: Any) -> bool:
+    """Default filter: include non-private callable methods defined in target class."""
+    return (
+        not name.startswith('_') and
+        callable(obj) and
+        (inspect.isfunction(obj) or inspect.ismethod(obj)) and
+        hasattr(obj, '__qualname__') and
+        self.target_class.__name__ in obj.__qualname__  # Check if class name is in qualname
+    )
 
-      if parm_opts:
-        help = []
-        if 'choices' in parm_opts:
-          help.append("Choices: [%(choices)s]")
-        elif 'type' in parm_opts:
-          help.append("Type:%(type)s")
+  def __discover_functions(self):
+    """Auto-discover functions from module using the filter."""
+    self.functions = {}
+    for name, obj in inspect.getmembers(self.target_module):
+      if self.function_filter(name, obj):
+        self.functions[name] = obj
 
-        if 'default' in parm_opts:
-          help.append("=%(default)s(default)")
+    # Build hierarchical command structure using CommandBuilder
+    self.commands = self._build_commands()
 
-        #help += f'keys={str(parm_opts.keys())}'
-        parm_opts['help'] = "".join(help)
-      parm_opts['metavar'] = parm_name.upper()
-      subparser.add_argument(f"--{parm_name}", **parm_opts)
+  def __discover_methods(self):
+    """Auto-discover methods from class using inner class pattern or direct methods."""
+    self.functions = {}
 
-  @staticmethod
-  def _add_enh_signature(enh_name, enh, str_builder):
-    """ Utility function to add signature of method """
-    parms = []
-    signature = inspect.signature(enh)
-    if signature != signature.empty:
-      for p in signature.parameters.values():
-        parm = f'{p.name}'
-        # Sig annotation, if any:
-        if p.annotation != p.empty:
-          if p.annotation == str:
-            parm += ':str'
-          if p.annotation == int:
-            parm += ':int'
-          else:
-            parm += f':{p.annotation}'
-        if p.default != p.empty:
-          parm += f'={p.default}'
-        parms.append(parm)
+    # Check for inner classes first (hierarchical organization)
+    inner_classes = self.__discover_inner_classes()
 
-      # Add all parms as string to sig:
-      parm_str = ', '.join(parms)
-      sig = f"{enh_name}({parm_str})"
-      if signature.return_annotation != signature.empty:
-        if p.annotation == str:
-          sig += ' => str'
-        else:
-          sig += f" => {signature.return_annotation}"
-      # str_builder.append(textwrap.indent("Signature:", CHAR_TAB))
-      # str_builder.append(textwrap.indent(sig, CHAR_TAB2))
-    return str_builder
+    if inner_classes:
+      # Use mixed pattern: both direct methods AND inner class methods
+      # Validate main class and inner class constructors
+      self.__validate_constructor_parameters(self.target_class, "main class")
+      for class_name, inner_class in inner_classes.items():
+        self.__validate_inner_class_constructor_parameters(inner_class, f"inner class '{class_name}'")
 
-  def create_arg_parser(self):
-    #HELP_FORMATTER = functools.partial(argparse.HelpFormatter, prog=None, max_help_position=120)
+      # Discover both direct methods and inner class methods
+      self.__discover_direct_methods()  # Direct methods on main class
+      self.__discover_methods_from_inner_classes(inner_classes)  # Inner class methods
+      self.use_inner_class_pattern = True
+    else:
+      # Use direct methods from the class (flat commands only)
+      # For direct methods, class should have parameterless constructor or all params with defaults
+      self.__validate_constructor_parameters(self.target_class, "class", allow_parameterless_only=True)
+
+      self.__discover_direct_methods()
+      self.use_inner_class_pattern = False
+
+    # Build hierarchical command structure using CommandBuilder
+    self.commands = self._build_commands()
+
+  def __discover_inner_classes(self) -> dict[str, type]:
+    """Discover inner classes that should be treated as command groups."""
+    inner_classes = {}
+
+    for name, obj in inspect.getmembers(self.target_class):
+      if (inspect.isclass(obj) and
+          not name.startswith('_') and
+          obj.__qualname__.endswith(f'{self.target_class.__name__}.{name}')):
+        inner_classes[name] = obj
+
+    return inner_classes
+
+  def __validate_constructor_parameters(self, cls: type, context: str, allow_parameterless_only: bool = False):
+    """Validate constructor parameters using ValidationService."""
+    from .validation import ValidationService
+    ValidationService.validate_constructor_parameters(cls, context, allow_parameterless_only)
+
+  def __validate_inner_class_constructor_parameters(self, cls: type, context: str):
+    """Validate inner class constructor parameters - first parameter should be main_instance."""
+    from .validation import ValidationService
+    ValidationService.validate_inner_class_constructor_parameters(cls, context)
+
+  def __discover_methods_from_inner_classes(self, inner_classes: dict[str, type]):
+    """Discover methods from inner classes for the new pattern."""
+    from .str_utils import StrUtils
+
+    # Store inner class info for later use in parsing/execution
+    self.inner_classes = inner_classes
+    self.use_inner_class_pattern = True
+
+    # For each inner class, discover its methods
+    for class_name, inner_class in inner_classes.items():
+      command_name = StrUtils.kebab_case(class_name)
+
+      # Get methods from the inner class
+      for method_name, method_obj in inspect.getmembers(inner_class):
+        if (not method_name.startswith('_') and
+            callable(method_obj) and
+            method_name != '__init__' and
+            inspect.isfunction(method_obj)):
+
+          # Create hierarchical name: command__command
+          hierarchical_name = f"{command_name}__{method_name}"
+          self.functions[hierarchical_name] = method_obj
+
+          # Store metadata for execution
+          if not hasattr(self, 'inner_class_metadata'):
+            self.inner_class_metadata = {}
+          self.inner_class_metadata[hierarchical_name] = {
+            'inner_class': inner_class,
+            'inner_class_name': class_name,
+            'command_name': command_name,
+            'method_name': method_name
+          }
+
+  def __discover_direct_methods(self):
+    """Discover methods directly from the class (flat command structure)."""
+    # Get all methods from the class that match our filter
+    for name, obj in inspect.getmembers(self.target_class):
+      if self.method_filter(name, obj):
+        # Store the unbound method - it will be bound at execution time
+        self.functions[name] = obj
+
+  def _init_completion(self, shell: str = None):
+    """Initialize completion handler if enabled.
+
+    :param shell: Target shell (auto-detect if None)
+    """
+    if not self.enable_completion:
+      return
+
+    try:
+      from .completion import get_completion_handler
+      self._completion_handler = get_completion_handler(self, shell)
+    except ImportError:
+      # Completion module not available
+      self.enable_completion = False
+
+  def _is_completion_request(self) -> bool:
+    """Check if this is a completion request."""
+    import os
+    return os.getenv('_AUTO_CLI_COMPLETE') is not None
+
+  def _handle_completion(self):
+    """Handle shell completion request."""
+    if hasattr(self, '_completion_handler'):
+      self._completion_handler.complete()
+    else:
+      # Initialize completion handler and try again
+      self._init_completion()
+      if hasattr(self, '_completion_handler'):
+        self._completion_handler.complete()
+
+
+
+
+
+  def _build_commands(self) -> dict[str, dict]:
+    """Build commands using centralized CommandBuilder service."""
+    builder = CommandBuilder(
+        target_mode=self.target_mode,
+        functions=self.functions,
+        inner_classes=getattr(self, 'inner_classes', {}),
+        use_inner_class_pattern=getattr(self, 'use_inner_class_pattern', False)
+    )
+    return builder.build_command_tree()
+
+
+  def create_parser(self, no_color: bool = False) -> argparse.ArgumentParser:
+    """Create argument parser with hierarchical command group support."""
+    # Create a custom formatter class that includes the theme (or no theme if no_color)
+    effective_theme = None if no_color else self.theme
+
+    def create_formatter_with_theme(*args, **kwargs):
+      formatter = HierarchicalHelpFormatter(*args, theme=effective_theme, alphabetize=self.alphabetize, **kwargs)
+      return formatter
+
     parser = argparse.ArgumentParser(
       description=self.title,
-      prog=self.title,
-      add_help=True,
-      formatter_class=functools.partial(argparse.HelpFormatter, prog=None, max_help_position=120)
+      formatter_class=create_formatter_with_theme
     )
 
-    subparser = parser.add_subparsers(
-      title='Commands',
-      description='Valid Commands',
-      help='Additional Help:',
-    )
+    # Store reference to parser in the formatter class so it can access all actions
+    # We'll do this after the parser is fully configured
+    def patch_formatter_with_parser_actions():
+      original_get_formatter = parser._get_formatter
 
-    # Custom help arg:
-    # parser.add_argument(
-    #   '-h',
-    #   '--help',
-    #   action="store_true",
-    #   help='Show help with increasing level of verbosity using --verbose flag'
-    # )
+      def patched_get_formatter():
+        formatter = original_get_formatter()
+        # Give the formatter access to the parser's actions
+        formatter._parser_actions = parser._actions
+        return formatter
 
+      parser._get_formatter = patched_get_formatter
+
+    # We need to patch this after the parser is fully set up
+    # Store the patch function for later use
+
+    # Monkey-patch the parser to style the title
+    original_format_help = parser.format_help
+
+    def patched_format_help():
+      # Get original help
+      original_help = original_format_help()
+
+      # Apply title styling if we have a theme
+      if effective_theme and self.title in original_help:
+        from .theme import ColorFormatter
+        color_formatter = ColorFormatter()
+        styled_title = color_formatter.apply_style(self.title, effective_theme.title)
+        # Replace the plain title with the styled version
+        original_help = original_help.replace(self.title, styled_title)
+
+      return original_help
+
+    parser.format_help = patched_format_help
+
+    # Add verbose flag for module-based CLIs (class-based CLIs use it as global parameter)
+    if self.target_mode == TargetMode.MODULE:
+      parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output"
+      )
+
+    # Add global no-color flag
     parser.add_argument(
-      "-v",
-      "--verbose",
-      help="increase output verbosity",
-      action="store_true"
+      "-n", "--no-color",
+      action="store_true",
+      help="Disable colored output"
     )
 
-    # Subparsers automatically setup based on function signatures:
-    for fn_name, fn_opt in self.function_opts.items():
-      callback_fn = functools.partial(self.fn_callback, fn_name)
-      self.setup_subparser(parser, subparser, fn_name, callback_fn, fn_opt["description"])
+    # Add completion-related hidden arguments
+    if self.enable_completion:
+      parser.add_argument(
+        "--_complete",
+        action="store_true",
+        help=argparse.SUPPRESS  # Hide from help
+      )
+
+    # Add global arguments from main class constructor (for inner class pattern)
+    if (self.target_mode == TargetMode.CLASS and
+        hasattr(self, 'use_inner_class_pattern') and
+        self.use_inner_class_pattern):
+      from .argument_parser import ArgumentParserService
+      ArgumentParserService.add_global_class_args(parser, self.target_class)
+
+    # Main subparsers
+    subparsers = parser.add_subparsers(
+      title='COMMANDS',
+      dest='command',
+      required=False,  # Allow no command to show help
+      help='Available commands',
+      metavar=''  # Remove the comma-separated list
+    )
+
+    # Store theme reference for consistency in subparsers
+    subparsers._theme = effective_theme
+
+    # Add commands (flat, groups, and nested groups)
+    self.__add_commands_to_parser(subparsers, self.commands, [])
+
+    # Now that the parser is fully configured, patch the formatter to have access to actions
+    patch_formatter_with_parser_actions()
 
     return parser
 
-  def setup_subparser(self, parser, subparser, fn_name, func_callback, help):
-    sub_parser = subparser.add_parser(fn_name, help=help)
+  def __add_commands_to_parser(self, subparsers, commands: dict, path: list):
+    """Recursively add commands to parser, supporting arbitrary nesting."""
+    for name, info in commands.items():
+      if info['type'] == 'group':
+        self.__add_command_group(subparsers, name, info, path + [name])
+      elif info['type'] == 'command':
+        self.__add_leaf_command(subparsers, name, info)
 
-    # Get signature parms and add corresponding arguments:
-    parms = self.sig_parms(fn_name)
-    CLI.add_sig_parm_args(parms, sub_parser)
+  def __add_command_group(self, subparsers, name: str, info: dict, path: list):
+    """Add a command group with commands (supports nesting)."""
+    # Check for inner class description
+    group_help = None
+    inner_class = None
 
-    help_formatter = functools.partial(argparse.HelpFormatter,prog=parser.prog,max_help_position=80)
-    sub_parser.set_defaults(func=func_callback)
-    sub_parser.formatter_class = help_formatter#argparse.HelpFormatter(prog=parser.prog, max_help_position=100)#   CLI.ArgFormatter#argparse.ArgumentDefaultsHelpFormatter
-    return sub_parser
+    if 'description' in info:
+      group_help = info['description']
+    else:
+      group_help = f"{name.title().replace('-', ' ')} operations"
 
-  @staticmethod
-  def __get_commands_help__(parser, command_name:str=None, usage=False):
-    helps = []
+    # Find the inner class for this command group (for sub-global arguments)
+    # First check if it's provided directly in the info (for system commands)
+    if 'inner_class' in info and info['inner_class']:
+      inner_class = info['inner_class']
+    elif (hasattr(self, 'use_inner_class_pattern') and
+          self.use_inner_class_pattern and
+          hasattr(self, 'inner_classes')):
+      for class_name, cls in self.inner_classes.items():
+        from .str_utils import StrUtils
+        if StrUtils.kebab_case(class_name) == name:
+          inner_class = cls
+          break
 
-    subparsers_actions = [
-      action for action in parser._actions
-      if isinstance(action, argparse._SubParsersAction)
-    ]
+    # Get the formatter class from the parent parser to ensure consistency
+    effective_theme = getattr(subparsers, '_theme', self.theme)
 
-    for subparsers_action in subparsers_actions:
-      for choice, subparser in subparsers_action.choices.items():
-        if command_name is None or command_name == choice:
-          if usage:
-            helps.append(subparser.format_usage())
-          else:
-            helps.append(f"Command '{choice}'")
-            #helps.append(textwrap.indent(subparser.format_help(), '  '))
-            helps.append(subparser.format_help())
+    def create_formatter_with_theme(*args, **kwargs):
+      return HierarchicalHelpFormatter(*args, theme=effective_theme, alphabetize=self.alphabetize, **kwargs)
 
-    return "\n".join(helps)
+    group_parser = subparsers.add_parser(
+      name,
+      help=group_help,
+      formatter_class=create_formatter_with_theme
+    )
 
-  def display(self):
-    parser = self.create_arg_parser()
-    try:
-      if len(sys.argv[1:])==0:
-        print(parser.format_help())
-        #parser.print_usage() # for just the usage line
-      else:
-        args = parser.parse_args()
-        if 'func' in args:
-          vargs = vars(args)
-          fn_args = {k: vargs[k] for k in vargs if k not in TOP_LEVEL_ARGS}
+    # Add sub-global arguments from inner class constructor
+    if inner_class:
+      from .argument_parser import ArgumentParserService
+      ArgumentParserService.add_subglobal_class_args(group_parser, inner_class, name)
 
-          # Show Usage no matter what:
-          cmd_name = args.func.args[0]# __name__.replace('_callback', '')
-          print(f"Command Name: {cmd_name}")
-          command_help = CLI.__get_commands_help__(parser, cmd_name, True)
-          #print(textwrap.indent(command_help, prefix='  '))
-          print(command_help)
+    # Store description for formatter to use
+    if 'description' in info:
+      group_parser._command_group_description = info['description']
+    group_parser._command_type = 'group'
 
-          args.func(fn_args)
-        # elif 'help' in args and args.help:
-        #   print("HELP:")
-        #   print(parser.format_help())
-        #   if 'verbose' in args:
-        #     print("Help for commands:")
-        #     command_help = CLI.__get_commands_help__(parser)
-        #     print(command_help)
+    # Mark as System command if applicable
+    if 'is_system_command' in info:
+      group_parser._is_system_command = info['is_system_command']
 
-    except Exception as x:
-      print(f"Unexpected Error: {type(x)}: '{x}'")
-      traceback.print_exc()
-      x.__traceback__.print_stack()
-    finally:
-      parser.exit()
+    # Store theme reference for consistency
+    group_parser._theme = effective_theme
+
+    # Store command info for help formatting
+    command_help = {}
+    for cmd_name, cmd_info in info['commands'].items():
+      if cmd_info['type'] == 'command':
+        func = cmd_info['function']
+        desc, _ = extract_function_help(func)
+        command_help[cmd_name] = desc
+      elif cmd_info['type'] == 'group':
+        # For nested groups, use their actual description if available
+        if 'description' in cmd_info and cmd_info['description']:
+          command_help[cmd_name] = cmd_info['description']
+        else:
+          command_help[cmd_name] = f"{cmd_name.title().replace('-', ' ')} operations"
+
+    group_parser._commands = command_help
+    group_parser._command_details = info['commands']
+
+    # Create command parsers with enhanced help
+    # Always use a unique dest name for nested subparsers to avoid conflicts
+    dest_name = '_'.join(path) + '_command'
+    sub_subparsers = group_parser.add_subparsers(
+      title=f'{name.title().replace("-", " ")} COMMANDS',
+      dest=dest_name,
+      required=False,
+      help=f'Available {name} commands',
+      metavar=''
+    )
+
+    # Store reference for enhanced help formatting
+    sub_subparsers._enhanced_help = True
+    sub_subparsers._command_details = info['commands']
+
+    # Store theme reference for consistency in nested subparsers
+    sub_subparsers._theme = effective_theme
+
+    # Recursively add commands
+    self.__add_commands_to_parser(sub_subparsers, info['commands'], path)
+
+  def __add_leaf_command(self, subparsers, name: str, info: dict):
+    """Add a leaf command (actual executable function)."""
+    func = info['function']
+    desc, _ = extract_function_help(func)
+
+    # Get the formatter class from the parent parser to ensure consistency
+    effective_theme = getattr(subparsers, '_theme', self.theme)
+
+    def create_formatter_with_theme(*args, **kwargs):
+      return HierarchicalHelpFormatter(*args, theme=effective_theme, alphabetize=self.alphabetize, **kwargs)
+
+    sub = subparsers.add_parser(
+      name,
+      help=desc,
+      description=desc,
+      formatter_class=create_formatter_with_theme
+    )
+    sub._command_type = 'command'
+
+    # Store theme reference for consistency
+    sub._theme = effective_theme
+
+    from .argument_parser import ArgumentParserService
+    ArgumentParserService.add_function_args(sub, func)
+
+    # Set defaults - command_path is optional for direct methods
+    defaults = {
+      '_cli_function': func,
+      '_function_name': info['original_name']
+    }
+
+    if 'command_path' in info:
+      defaults['_command_path'] = info['command_path']
+
+    if 'is_system_command' in info:
+      defaults['_is_system_command'] = info['is_system_command']
+
+    sub.set_defaults(**defaults)
+
+
 
